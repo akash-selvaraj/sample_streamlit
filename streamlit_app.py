@@ -118,22 +118,15 @@ def login_ui():
 
 
 def handle_oauth_redirect():
-    # UPDATED: use st.query_params (dict-like, string values)
     params = st.query_params
     code = params.get("code")
     state = params.get("state")
     if not code or not state:
         return False
 
-    # Decrypt returned state and compare to raw session value
-    try:
-        f = get_fernet()
-        returned_raw_state = f.decrypt(state.encode()).decode()
-        if returned_raw_state != st.session_state.get("oauth_state_raw"):
-            st.warning("State mismatch in OAuth flow. Try logging in again.")
-            return False
-    except Exception:
-        st.warning("Invalid OAuth state token. Please try logging in again.")
+    # ✅ Compare directly to stored encrypted state
+    if state != st.session_state.get("oauth_state_enc"):
+        st.warning("State mismatch in OAuth flow. Try logging in again.")
         return False
 
     oauth = get_oauth_session()
@@ -143,6 +136,7 @@ def handle_oauth_redirect():
         code=code,
         grant_type="authorization_code",
     )
+
     # Fetch userinfo
     resp = oauth.get("https://openidconnect.googleapis.com/v1/userinfo", token=token)
     if resp.status_code != 200:
@@ -169,19 +163,20 @@ def handle_oauth_redirect():
                 "email": profile.get("email"),
                 "name": profile.get("name"),
                 "google_sub": profile.get("sub"),
+                "subscription_active": False,
             },
             "$set": {"last_login": datetime.utcnow()},
-            "$setOnInsert": {"subscription_active": False},
         },
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
 
-    # UPDATED: Clear query string (replaces experimental_set_query_params)
+    # ✅ Clear query string safely
     try:
         st.query_params.clear()
     except Exception:
         pass
+
     return True
 
 
