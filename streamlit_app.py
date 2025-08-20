@@ -1,15 +1,10 @@
-# streamlit_app.py
+# streamlit_app.py (fixed)
 # --- Legal Survey Analysis App: SaaS Upgrade ---
-# Features:
-# - Tabs: Data Preview | Visualizations | Summaries | Hypothesis Testing | AI Chat | Settings
-# - OAuth (Google) login via Authlib; session persisted without repeated prompts
-# - MongoDB for users; Gemini API key + subscription flag stored encrypted (Fernet)
-# - Cashfree subscription (₹119/mo) checkout & verification inside the app
-# - RAG over uploaded dataset for chatbot; chat-style UI w/ history
-# - Visual UX: Y-axis Count or Percentage; horizontal wrapped X labels; auto width; optional color customization
-# - Data summaries (mean, median, mode)
-# - Crosstab tables w/ totals; download as Excel
-# - Hypothesis generation + auto test selection (ANOVA, Chi-square, t-test, F-test) + manual override
+# Changes in this version:
+# - Replaced st.experimental_get_query_params -> st.query_params
+# - Removed st.experimental_set_query_params; now using st.query_params.clear()
+# - Hardened OAuth state handling with Fernet-encrypted state token to avoid mismatches
+# - Minor robustness tweaks (comments show UPDATED sections)
 
 from __future__ import annotations
 
@@ -53,6 +48,7 @@ SUBSCRIPTION_PRICE_INR = 119
 def get_fernet() -> Fernet:
     key = st.secrets.get("FERNET_KEY")
     if not key:
+        st.error("FERNET_KEY missing in secrets.")
         st.stop()
     return Fernet(key.encode() if isinstance(key, str) else key)
 
@@ -82,7 +78,7 @@ def get_users_col():
 
 # -------------- AUTH (GOOGLE OAUTH) --------------
 
-def get_oauth_session(state: Optional[str] = None) -> OAuth2Session:
+def get_oauth_session() -> OAuth2Session:
     client_id = st.secrets.get("GOOGLE_CLIENT_ID")
     client_secret = st.secrets.get("GOOGLE_CLIENT_SECRET")
     redirect_uri = st.secrets.get("OAUTH_REDIRECT_URI")
@@ -94,7 +90,6 @@ def get_oauth_session(state: Optional[str] = None) -> OAuth2Session:
         client_secret,
         scope="openid email profile",
         redirect_uri=redirect_uri,
-        state=state,
     )
 
 
@@ -102,24 +97,46 @@ def login_ui():
     st.markdown("### Login")
     oauth = get_oauth_session()
     authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth"
-    uri, state = oauth.create_authorization_url(authorization_endpoint, prompt="consent")
-    st.session_state["oauth_state"] = state
+
+    # UPDATED: generate raw state, store in session, send ENCRYPTED state in URL
+    f = get_fernet()
+    raw_state = st.session_state.get("oauth_state_raw")
+    if not raw_state:
+        import secrets as _secrets
+        raw_state = _secrets.token_urlsafe(16)
+        st.session_state["oauth_state_raw"] = raw_state
+    enc_state = f.encrypt(raw_state.encode()).decode()
+    st.session_state["oauth_state_enc"] = enc_state
+
+    # Authlib lets us pass extra params to authorization URL
+    uri, _generated_state = oauth.create_authorization_url(
+        authorization_endpoint,
+        prompt="consent",
+        state=enc_state,  # we control state token
+    )
     st.link_button("Sign in with Google", uri, use_container_width=True)
 
 
 def handle_oauth_redirect():
-    # Parse 'code' and 'state' from URL
-    params = st.experimental_get_query_params()
-    code = params.get("code", [None])[0]
-    state = params.get("state", [None])[0]
+    # UPDATED: use st.query_params (dict-like, string values)
+    params = st.query_params
+    code = params.get("code")
+    state = params.get("state")
     if not code or not state:
         return False
 
-    if state != st.session_state.get("oauth_state"):
-        st.warning("State mismatch in OAuth flow. Try logging in again.")
+    # Decrypt returned state and compare to raw session value
+    try:
+        f = get_fernet()
+        returned_raw_state = f.decrypt(state.encode()).decode()
+        if returned_raw_state != st.session_state.get("oauth_state_raw"):
+            st.warning("State mismatch in OAuth flow. Try logging in again.")
+            return False
+    except Exception:
+        st.warning("Invalid OAuth state token. Please try logging in again.")
         return False
 
-    oauth = get_oauth_session(state)
+    oauth = get_oauth_session()
     token_endpoint = "https://oauth2.googleapis.com/token"
     token = oauth.fetch_token(
         token_endpoint,
@@ -160,8 +177,11 @@ def handle_oauth_redirect():
         return_document=ReturnDocument.AFTER,
     )
 
-    # Clean URL of code/state so refreshes don’t ask again
-    st.experimental_set_query_params()
+    # UPDATED: Clear query string (replaces experimental_set_query_params)
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
     return True
 
 
@@ -196,12 +216,12 @@ def create_cashfree_order(amount_inr: int, customer_id: str, customer_email: str
         },
         "order_note": f"{APP_NAME} Monthly Subscription",
         "order_meta": {
-            "return_url": st.secrets.get("OAUTH_REDIRECT_URI")  # reuse redirect URI to land back
+            "return_url": st.secrets.get("OAUTH_REDIRECT_URI")
         },
     }
     try:
         r = requests.post(f"{CF_BASE}/orders", headers=cf_headers(), data=json.dumps(payload), timeout=20)
-        if r.status_code == 200:
+        if r.status_code in (200, 201):
             return r.json()
         else:
             st.error(f"Cashfree order error: {r.status_code} {r.text}")
@@ -276,7 +296,6 @@ def auto_fig_width(n_cats: int, base=6.0, per_cat=0.4, maxw=20.0) -> float:
 
 def compute_crosstab(df: pd.DataFrame, row: str, col: str, values: Optional[str] = None, normalize: Optional[str] = None) -> pd.DataFrame:
     if values and values in df.columns:
-        # values assumed to be boolean-like or categorical; we generate counts by values
         ct = pd.crosstab(df[row], [df[col], df[values]], margins=True, dropna=False, normalize=normalize)
     else:
         ct = pd.crosstab(df[row], df[col], margins=True, dropna=False, normalize=normalize)
@@ -295,10 +314,8 @@ def df_to_excel_download(df_dict: Dict[str, pd.DataFrame], filename: str = "tabl
 # -------------- RAG over Data --------------
 
 def build_rag_chunks(df: pd.DataFrame, max_rows: int = 200) -> List[str]:
-    # Sample for speed
     sdf = df.sample(min(len(df), max_rows), random_state=42) if len(df) > max_rows else df.copy()
     chunks = []
-    # Column summaries
     for col in sdf.columns:
         series = sdf[col]
         if pd.api.types.is_numeric_dtype(series):
@@ -308,7 +325,6 @@ def build_rag_chunks(df: pd.DataFrame, max_rows: int = 200) -> List[str]:
             vc = series.astype(str).value_counts().head(20).to_dict()
             chunk = f"Column: {col} (categorical). Top values: {json.dumps(vc)}"
         chunks.append(chunk)
-    # A few row snapshots
     for _, row in sdf.head(30).iterrows():
         chunks.append(f"Row: {json.dumps(row.to_dict(), default=str)}")
     return chunks
@@ -344,7 +360,7 @@ TESTS_HELP = {
 
 def auto_select_test(df: pd.DataFrame, y: str, x: Optional[str]) -> str:
     if x is None:
-        return "t-test (independent)"  # default single numeric? will prompt user
+        return "t-test (independent)"
     y_is_num = pd.api.types.is_numeric_dtype(df[y])
     x_is_num = pd.api.types.is_numeric_dtype(df[x])
     if (not y_is_num) and (not x_is_num):
@@ -355,7 +371,6 @@ def auto_select_test(df: pd.DataFrame, y: str, x: Optional[str]) -> str:
     if (not y_is_num) and x_is_num:
         k = df[y].nunique(dropna=True)
         return "t-test (independent)" if k == 2 else "ANOVA"
-    # both numeric -> F-test on variances
     return "F-test (variances)"
 
 
@@ -369,7 +384,6 @@ def run_test(df: pd.DataFrame, test_name: str, y: str, x: Optional[str]) -> Dict
         return res
 
     if test_name == "t-test (independent)":
-        # numeric y across two groups defined by x
         if x is None:
             res["notes"] = "x (group) is required for t-test."
             return res
@@ -395,7 +409,6 @@ def run_test(df: pd.DataFrame, test_name: str, y: str, x: Optional[str]) -> Dict
         return res
 
     if test_name == "F-test (variances)":
-        # two numeric samples (choose two columns via y and x)
         if x is None:
             res["notes"] = "Select two numeric variables (y and x) for F-test."
             return res
@@ -490,7 +503,8 @@ subscription_active = bool(user_rec.get("subscription_active", False))
 
 # Sidebar: Profile & Subscription
 with st.sidebar:
-    st.image(user.get("picture"), width=64) if user.get("picture") else None
+    if user.get("picture"):
+        st.image(user.get("picture"), width=64)
     st.markdown(f"**{user.get('name','User')}**\n\n{user.get('email','')}")
     st.markdown("---")
     if subscription_active:
@@ -503,7 +517,10 @@ with st.sidebar:
             if order and order.get("payment_session_id"):
                 st.session_state["cf_order_id"] = order.get("order_id")
                 st.session_state["cf_payment_session_id"] = order.get("payment_session_id")
-                st.markdown(f"[Proceed to Cashfree Checkout]({order.get('payment_link')})")
+                if order.get("payment_link"):
+                    st.markdown(f"[Proceed to Cashfree Checkout]({order.get('payment_link')})")
+                else:
+                    st.info("Order created. Complete payment in the opened Cashfree page.")
             elif order and order.get("order_id"):
                 st.markdown(f"Order created. ID: `{order['order_id']}`")
 
@@ -517,7 +534,7 @@ with st.sidebar:
                 st.success("Payment verified! Subscription activated.")
                 get_users_col().update_one({"google_sub": user["sub"]}, {"$set": {"subscription_active": True, "subscription_updated": datetime.utcnow()}})
             else:
-                st.info("Payment not captured yet. If you just paid, try again in a few seconds.")
+                st.info("Payment not captured yet. If you just paid, try again shortly.")
 
     st.markdown("---")
     # Gemini Key (encrypted per user)
@@ -529,8 +546,6 @@ with st.sidebar:
             if st.button("Save", type="primary") and k:
                 save_user_gemini_key(k)
                 st.success("Saved (encrypted). Close this dialog.")
-
-# Subscription gate (soft); allow upload but gate AI features if desired
 
 # -------------- FILE UPLOAD --------------
 with st.container(border=True):
@@ -554,11 +569,7 @@ cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
 all_cols = list(df.columns)
 
 # Precompute RAG chunks for AI Tab
-if "rag_chunks" not in st.session_state:
-    st.session_state["rag_chunks"] = build_rag_chunks(df)
-else:
-    # refresh when dataset changes (simple heuristic)
-    st.session_state["rag_chunks"] = build_rag_chunks(df)
+st.session_state["rag_chunks"] = build_rag_chunks(df)
 
 # -------------- TABS --------------
 
@@ -614,8 +625,10 @@ with tab_viz:
 
             bars = ax.bar(vc.index, y_vals, color=bar_color or ("#87CEEB" if selected_col in cat_cols else "#90EE90"))
 
-            # labels inside bars as % of total when percentage selected, else counts
-            labels = [f"{(v.get_height() if y_mode=='Count' else v.get_height()):.1f}{'' if y_mode=='Count' else '%'}" for v in bars]
+            labels = [
+                f"{int(v.get_height())}" if y_mode=="Count" else f"{v.get_height():.1f}%"
+                for v in bars
+            ]
             ax.bar_label(bars, labels=labels, label_type='edge', color='black', fontsize=9)
 
             ax.set_ylabel(ylabel)
@@ -764,7 +777,6 @@ with tab_chat:
         st.session_state["chat_history"].append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.markdown(question)
-        # RAG retrieve
         chunks = rag_retrieve(question, st.session_state.get("rag_chunks", []), top_k=8)
         key = get_user_gemini_key()
         if not key:
@@ -774,7 +786,7 @@ with tab_chat:
                 st.markdown(answer)
         else:
             data_desc = df.describe(include='all').to_csv(errors='ignore') if len(df) > 100 else df.to_csv(index=False)
-            ai_mode = "Generate a visualization" if "plot" in question.lower() or "chart" in question.lower() else "Answer a question"
+            ai_mode = "Generate a visualization" if any(w in question.lower() for w in ["plot", "chart", "graph", "visualize"]) else "Answer a question"
             if ai_mode == "Generate a visualization":
                 prompt = f"""
 You are an expert data visualization analyst. Use the user's question and retrieved context from the dataset to produce code for a Matplotlib graph.
@@ -799,7 +811,6 @@ User question: {question}
             with st.spinner("Thinking with Gemini..."):
                 js = gemini_generate_json(prompt, key)
 
-            # Render assistant message
             with st.chat_message("assistant"):
                 st.markdown(js.get('answer', '(No answer)'))
                 if js.get('code'):
